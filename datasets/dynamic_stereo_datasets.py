@@ -6,8 +6,8 @@
 # # Data loading based on https://github.com/NVIDIA/flownet2-pytorch
 
 
-import os
-import copy
+import os,pdb,sys
+import copy,cv2,joblib,imageio,importlib
 import gzip
 import logging
 import torch
@@ -61,6 +61,10 @@ class StereoSequenceDataset(data.Dataset):
         self.sample_list = []
         self.extra_info = []
         self.depth_eps = 1e-5
+
+
+    def get_seq_len(self, i_seq):
+      return len(self.sample_list[i_seq]["image"]["left"])
 
     def _load_16big_png_depth(self, depth_png):
         with Image.open(depth_png) as depth_pil:
@@ -121,9 +125,11 @@ class StereoSequenceDataset(data.Dataset):
             T=torch.tensor(entry_viewpoint.T, dtype=torch.float)[None],
         )
 
-    def _get_output_tensor(self, sample):
+    def _get_output_tensor(self, sample, ignore_keys=None, cams=["left", "right"], frame_ids=None):
         output_tensor = defaultdict(list)
         sample_size = len(sample["image"]["left"])
+        if frame_ids is None:
+          frame_ids = np.arange(sample_size)
         output_tensor_keys = ["img", "disp", "valid_disp", "mask"]
         add_keys = ["viewpoint", "metadata"]
         for add_key in add_keys:
@@ -131,7 +137,9 @@ class StereoSequenceDataset(data.Dataset):
                 output_tensor_keys.append(add_key)
 
         for key in output_tensor_keys:
-            output_tensor[key] = [[] for _ in range(sample_size)]
+            if ignore_keys is not None and key in ignore_keys:
+              continue
+            output_tensor[key] = [[] for _ in range(len(frame_ids))]
 
         if "viewpoint" in sample:
             viewpoint_left = self._get_pytorch3d_camera(
@@ -150,24 +158,27 @@ class StereoSequenceDataset(data.Dataset):
                 torch.Tensor(sample["metadata"]["left"][0][1])[None],
             )
 
-        for i in range(sample_size):
-            for cam in ["left", "right"]:
-                if "mask" in sample and cam in sample["mask"]:
-                    mask = frame_utils.read_gen(sample["mask"][cam][i])
-                    mask = np.array(mask) / 255.0
-                    output_tensor["mask"][i].append(mask)
+        for pos, i in enumerate(frame_ids):
+            for cam in cams:
+                if ignore_keys is not None and 'mask' not in ignore_keys:
+                  if "mask" in sample and cam in sample["mask"]:
+                      mask = frame_utils.read_gen(sample["mask"][cam][i])
+                      mask = np.array(mask) / 255.0
+                      output_tensor["mask"][pos].append(mask)
 
-                if "viewpoint" in sample and cam in sample["viewpoint"]:
-                    viewpoint = self._get_pytorch3d_camera(
-                        sample["viewpoint"][cam][i],
-                        sample["metadata"][cam][i][1],
-                        scale=1.0,
-                    )
-                    output_tensor["viewpoint"][i].append(viewpoint)
+                if ignore_keys is not None and 'viewpoint' not in ignore_keys:
+                  if "viewpoint" in sample and cam in sample["viewpoint"]:
+                      viewpoint = self._get_pytorch3d_camera(
+                          sample["viewpoint"][cam][i],
+                          sample["metadata"][cam][i][1],
+                          scale=1.0,
+                      )
+                      output_tensor["viewpoint"][pos].append(viewpoint)
 
-                if "metadata" in sample and cam in sample["metadata"]:
-                    metadata = sample["metadata"][cam][i]
-                    output_tensor["metadata"][i].append(metadata)
+                if ignore_keys is not None and 'metadata' not in ignore_keys:
+                  if "metadata" in sample and cam in sample["metadata"]:
+                      metadata = sample["metadata"][cam][i]
+                      output_tensor["metadata"][pos].append(metadata)
 
                 if cam in sample["image"]:
 
@@ -179,7 +190,7 @@ class StereoSequenceDataset(data.Dataset):
                         img = np.tile(img[..., None], (1, 1, 3))
                     else:
                         img = img[..., :3]
-                    output_tensor["img"][i].append(img)
+                    output_tensor["img"][pos].append(img)
 
                 if cam in sample["disparity"]:
                     disp = self.disparity_reader(sample["disparity"][cam][i])
@@ -191,8 +202,8 @@ class StereoSequenceDataset(data.Dataset):
 
                     disp = np.stack([-disp, np.zeros_like(disp)], axis=-1)
 
-                    output_tensor["disp"][i].append(disp)
-                    output_tensor["valid_disp"][i].append(valid_disp)
+                    output_tensor["disp"][pos].append(disp)
+                    output_tensor["valid_disp"][pos].append(valid_disp)
 
                 elif "depth" in sample and cam in sample["depth"]:
                     depth = self.depth_reader(sample["depth"][cam][i])
@@ -205,15 +216,20 @@ class StereoSequenceDataset(data.Dataset):
                     valid_disp = (disp < 512) * (1 - depth_mask)
 
                     disp = np.array(disp).astype(np.float32)
-                    disp = np.stack([-disp, np.zeros_like(disp)], axis=-1)
-                    output_tensor["disp"][i].append(disp)
-                    output_tensor["valid_disp"][i].append(valid_disp)
+                    disp = np.stack([disp, np.zeros_like(disp)], axis=-1)
+                    output_tensor["disp"][pos].append(disp)
+                    output_tensor["valid_disp"][pos].append(np.asarray(valid_disp).astype(np.uint8))
 
         return output_tensor
 
-    def __getitem__(self, index):
+    def __getitem__(self, index, ignore_keys=None, frame_ids=None):
         im_tensor = {"img"}
         sample = self.sample_list[index]
+        sample_size = len(sample["image"]["left"])
+        print(f'sample_size: {sample_size}')
+        if frame_ids is None:
+          frame_ids = np.arange(sample_size)
+
         if self.is_test:
             sample_size = len(sample["image"]["left"])
             im_tensor["img"] = [[] for _ in range(sample_size)]
@@ -229,41 +245,42 @@ class StereoSequenceDataset(data.Dataset):
         index = index % len(self.sample_list)
 
         try:
-            output_tensor = self._get_output_tensor(sample)
+            print(f"Getting output_tensor...")
+            output_tensor = self._get_output_tensor(sample, ignore_keys=ignore_keys, frame_ids=frame_ids)
         except:
-            logging.warning(f"Exception in loading sample {index}!")
-            index = np.random.randint(len(self.sample_list))
-            logging.info(f"New index is {index}")
-            sample = self.sample_list[index]
-            output_tensor = self._get_output_tensor(sample)
-        sample_size = len(sample["image"]["left"])
+            raise RuntimeError(f'index:{index}')
+            # logging.warning(f"Exception in loading sample {index}!")
+            # index = np.random.randint(len(self.sample_list))
+            # logging.info(f"New index is {index}")
+            # sample = self.sample_list[index]
+            # output_tensor = self._get_output_tensor(sample, ignore_keys=ignore_keys)
 
         if self.augmentor is not None:
             output_tensor["img"], output_tensor["disp"] = self.augmentor(
                 output_tensor["img"], output_tensor["disp"]
             )
-        for i in range(sample_size):
+        for i in range(len(frame_ids)):
             for cam in (0, 1):
                 if cam < len(output_tensor["img"][i]):
                     img = (
-                        torch.from_numpy(output_tensor["img"][i][cam])
+                        torch.as_tensor(output_tensor["img"][i][cam])
                         .permute(2, 0, 1)
                         .float()
                     )
                     if self.img_pad is not None:
                         padH, padW = self.img_pad
                         img = F.pad(img, [padW] * 2 + [padH] * 2)
-                    output_tensor["img"][i][cam] = img
+                    output_tensor["img"][i][cam] = img.data.cpu().numpy().astype(np.uint8)
 
                 if cam < len(output_tensor["disp"][i]):
                     disp = (
-                        torch.from_numpy(output_tensor["disp"][i][cam])
+                        torch.as_tensor(output_tensor["disp"][i][cam])
                         .permute(2, 0, 1)
                         .float()
                     )
 
                     if self.sparse:
-                        valid_disp = torch.from_numpy(
+                        valid_disp = torch.as_tensor(
                             output_tensor["valid_disp"][i][cam]
                         )
                     else:
@@ -274,11 +291,11 @@ class StereoSequenceDataset(data.Dataset):
                         )
                     disp = disp[:1]
 
-                    output_tensor["disp"][i][cam] = disp
-                    output_tensor["valid_disp"][i][cam] = valid_disp.float()
+                    output_tensor["disp"][i][cam] = disp.data.cpu().numpy().astype(np.float32)
+                    output_tensor["valid_disp"][i][cam] = valid_disp.data.cpu().numpy().astype(np.uint8)
 
                 if "mask" in output_tensor and cam < len(output_tensor["mask"][i]):
-                    mask = torch.from_numpy(output_tensor["mask"][i][cam]).float()
+                    mask = torch.as_tensor(output_tensor["mask"][i][cam]).float()
                     output_tensor["mask"][i][cam] = mask
 
                 if "viewpoint" in output_tensor and cam < len(
@@ -293,13 +310,17 @@ class StereoSequenceDataset(data.Dataset):
         if "metadata" in output_tensor and self.split != "train":
             res["metadata"] = output_tensor["metadata"]
 
-        for k, v in output_tensor.items():
-            if k != "viewpoint" and k != "metadata":
-                for i in range(len(v)):
-                    if len(v[i]) > 0:
-                        v[i] = torch.stack(v[i])
-                if len(v) > 0 and (len(v[0]) > 0):
-                    res[k] = torch.stack(v)
+        # pdb.set_trace()
+        res = output_tensor
+        # for k, v in output_tensor.items():
+        #     print(k)
+        #     if k != "viewpoint" and k != "metadata":
+        #         for i in range(len(v)):
+        #             if len(v[i]) > 0:
+        #                 v[i] = torch.stack(v[i])
+        #         if len(v) > 0 and (len(v[0]) > 0):
+        #             res[k] = torch.stack(v)
+        # pdb.set_trace()
         return res
 
     def __mul__(self, v):
@@ -339,7 +360,7 @@ class DynamicReplicaDataset(StereoSequenceDataset):
             seq_annot[frame_annot.sequence_name][frame_annot.camera_name].append(
                 frame_annot
             )
-
+        print(f'seq_annot#: {len(seq_annot)}')
         for seq_name in seq_annot.keys():
             try:
                 filenames = defaultdict(lambda: defaultdict(list))
@@ -353,6 +374,7 @@ class DynamicReplicaDataset(StereoSequenceDataset):
                         assert os.path.isfile(depth_path), depth_path
                         assert os.path.isfile(mask_path), mask_path
 
+                        # print(f'im_path: {im_path}')
                         filenames["image"][cam].append(im_path)
                         filenames["depth"][cam].append(depth_path)
                         filenames["mask"][cam].append(mask_path)
@@ -696,3 +718,102 @@ def fetch_dataloader(args):
 
     logging.info("Training with %d image pairs" % len(train_dataset))
     return train_loader
+
+
+def warp_with_disp(image_r, disp_l):
+  H,W = image_r.shape[:2]
+  xx,yy = np.meshgrid(np.arange(W), np.arange(H))
+  xx_r = xx-disp_l
+  valid = (xx_r>=0) & (xx_r<W)
+  image_r_virtual = cv2.remap(image_r, map1=xx_r.astype(np.float32), map2=yy.astype(np.float32), interpolation=cv2.INTER_LINEAR)
+  image_r_virtual[valid==0] = 0
+  return image_r_virtual
+
+
+
+def depth_to_uint8_encoding(depth, scale=1000):
+  depth = depth*scale
+  H,W = depth.shape
+  out = np.zeros((H,W,3), dtype=float)
+  out[...,0] = depth//(255*255)
+  out[...,1] = (depth-out[...,0]*255*255)//255
+  out[...,2] = depth-out[...,0]*255*255-out[...,1]*255
+  if not (out[...,2]<=255).all():
+    print(f"min:{out[...,2].min()}, max:{out[...,2].max()}")
+    pdb.set_trace()
+  return out.astype(np.uint8)
+
+
+def set_logging_format(level=logging.INFO, log_file=None):
+  importlib.reload(logging)
+  logger = logging.getLogger()
+  logger.setLevel(level)
+  FORMAT = '%(asctime)s|%(process)d|%(filename)s:%(lineno)d|%(funcName)s()] %(message)s'
+  formatter = logging.Formatter(FORMAT)
+  stdout_handler = logging.StreamHandler(sys.stdout)
+  stdout_handler.setFormatter(formatter)
+  logger.addHandler(stdout_handler)
+
+  if log_file is not None:
+    file_handler = logging.FileHandler(log_file, 'w+')
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+
+if __name__=="__main__":
+  set_logging_format()
+
+  for split in ['test', 'valid', 'train']:
+    dataset = DynamicReplicaDataset(root='/lustre/fsw/portfolios/nvr/projects/nvr_lpr_dataefficientml/dynamic_replica_data', split=split)
+    print(f'split: {split}, dataset#: {len(dataset)}')
+
+    # for i in range(len(dataset)):
+    #   print(f'i:{i}/{len(dataset)}')
+
+    #   args = np.arange(len(sample['img']))
+      # for ii in range(len(sample['img'])):
+      #   args.append((sample, ii))
+
+    # i = 0
+    # ks = list(sample.keys())
+    # for k in ks:
+    #   if k not in ['img','disp']:
+    #     del sample[k]
+
+    def worker(i_seq, frame_id):
+      logging.info(f"sample:{i_seq}/{len(dataset)}")
+      sample = dataset.__getitem__(i_seq, ignore_keys=['mask', 'viewpoint', 'metadata'], frame_ids=[frame_id])
+      img_left = sample['img'][0][0].transpose(1,2,0)
+      img_right = sample['img'][0][1].transpose(1,2,0)
+      left_path = dataset.sample_list[i_seq]["image"]['left'][frame_id]
+      right_path = dataset.sample_list[i_seq]["image"]['right'][frame_id]
+      disp = sample['disp'][0][0][0]
+
+      #######!DEBUG
+      # if frame_id%100==0:
+      #   warped = warp_with_disp(img_right, disp)
+      #   vis = np.concatenate([img_left, img_right, warped], axis=1)
+      #   cv2.imwrite(f'/home/bowenw/debug/vis.png', vis.astype(np.uint8)[...,::-1])
+      #   pdb.set_trace()
+
+      left_out_path = left_path.replace(f'/images/','/images_jpg/').replace('.png','.jpg')
+      right_out_path = right_path.replace(f'/images/','/images_jpg/').replace('.png','.jpg')
+      disp_out_path = left_path.replace(f'/images/','/disp/')
+      os.makedirs(os.path.dirname(left_out_path), exist_ok=True)
+      os.makedirs(os.path.dirname(right_out_path), exist_ok=True)
+      os.makedirs(os.path.dirname(disp_out_path), exist_ok=True)
+      cv2.imwrite(left_out_path, img_left[...,::-1], [int(cv2.IMWRITE_JPEG_QUALITY), 100])
+      cv2.imwrite(right_out_path, img_right[...,::-1], [int(cv2.IMWRITE_JPEG_QUALITY), 100])
+      disp_encoding = depth_to_uint8_encoding(disp, scale=1000)
+      imageio.imwrite(disp_out_path, disp_encoding)
+      # pdb.set_trace()
+      len_seq = dataset.get_seq_len(i_seq)
+      logging.info(f"worker ii:{frame_id}/{len_seq}, left_out_path:{left_out_path}")
+
+    args = []
+    for i_seq in range(len(dataset)):
+      len_seq = dataset.get_seq_len(i_seq)
+      for frame_id in range(len_seq):
+        args.append((i_seq, frame_id))
+      joblib.Parallel(n_jobs=40)(joblib.delayed(worker)(*arg) for arg in args)
+      # raise RuntimeError
